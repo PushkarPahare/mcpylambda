@@ -1,15 +1,15 @@
-# Conductor 🎼
+# mcpylambda 🎼
 
 **Transform your APIs into AI agent tools with zero hassle**
 
-Conductor is a Python framework that makes it incredibly easy to create Model Context Protocol (MCP) servers in AWS Lambda. Turn your existing APIs into tools that AI agents can discover and use automatically.
+Mcpylambda is a Python framework that makes it incredibly easy to create Model Context Protocol (MCP) servers in AWS Lambda. Turn your existing APIs into tools that AI agents can discover and use automatically.
 
 [![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
 [![AWS Lambda](https://img.shields.io/badge/AWS-Lambda-orange.svg)](https://aws.amazon.com/lambda/)
 [![MCP Protocol](https://img.shields.io/badge/MCP-2024--11--05-green.svg)](https://modelcontextprotocol.io/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](#)
 
-## 🚀 **Why Conductor?**
+## 🚀 **Why Mcpylambda?**
 
 ```python
 # Before: Complex MCP server setup, manual schema generation, protocol handling...
@@ -29,7 +29,7 @@ def add(a: float, b: float, client: CalculatorClient) -> dict:
 - Lambda deployment complexity for serverless MCP servers
 
 ### **The Solution**
-Conductor handles all the complexity so you can focus on your business logic:
+Mcpylambda handles all the complexity so you can focus on your business logic:
 - ✅ **Decorator-based API** - Just add `@framework.tool()`
 - ✅ **Automatic schema generation** - From Python type hints
 - ✅ **Client dependency injection** - Type-hint based, automatic
@@ -42,21 +42,21 @@ Conductor handles all the complexity so you can focus on your business logic:
 ### Option 1: Copy & Paste (Recommended for Lambda)
 ```bash
 # Download the single file
-curl -O https://raw.githubusercontent.com/your-repo/conductor/main/conductor.py
+curl -O https://raw.githubusercontent.com/your-repo/Mcpylambda/main/Mcpylambda.py
 
 # Copy into your Lambda function - that's it!
 ```
 
 ### Option 2: Package Installation
 ```bash
-pip install conductor-mcp
+pip install Mcpylambda-mcp
 ```
 
 ## ⚡ **Quick Start**
 
 ### 1. **Create Your Client**
 ```python
-from conductor import MCPClient, framework
+from Mcpylambda import MCPClient, framework
 
 class MyAPIClient(MCPClient):
     def authenticate(self) -> bool:
@@ -241,7 +241,7 @@ def create_user(name: str, email: str, client: WriteDBClient) -> dict:
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
 │   AI Agent      │    │   AWS Lambda     │    │   Your APIs     │
-│  (Claude, etc.) │◄──►│   + Conductor    │◄──►│  (Any Service)  │
+│  (Claude, etc.) │◄──►│   + Mcpylambda    │◄──►│  (Any Service)  │
 └─────────────────┘    └──────────────────┘    └─────────────────┘
         │                        │                        │
         │                        │                        │
@@ -364,7 +364,7 @@ python test_mcp_server.py
 
 ### **Custom Response Types**
 ```python
-from conductor import MCPToolResult, MCPContent, MCPContentType
+from Mcpylambda import MCPToolResult, MCPContent, MCPContentType
 
 @framework.tool()
 def advanced_analysis(query: str) -> MCPToolResult:
@@ -491,8 +491,8 @@ We welcome contributions! Here's how to get started:
 
 ```bash
 # Clone the repo
-git clone https://github.com/your-org/conductor.git
-cd conductor
+git clone https://github.com/your-org/Mcpylambda.git
+cd Mcpylambda
 
 # Run tests
 python -m pytest tests/
@@ -507,11 +507,11 @@ python examples/calculator_server.py
 pip install -r requirements-dev.txt
 
 # Run linting
-black conductor/
-flake8 conductor/
+black Mcpylambda/
+flake8 Mcpylambda/
 
 # Run type checking  
-mypy conductor/
+mypy Mcpylambda/
 ```
 
 ## 📄 **License**
@@ -526,13 +526,13 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## 🔗 **Links**
 
-- **Documentation**: [https://conductor-mcp.readthedocs.io](https://conductor-mcp.readthedocs.io)
-- **Examples**: [https://github.com/your-org/conductor/tree/main/examples](https://github.com/your-org/conductor/tree/main/examples)
-- **Issues**: [https://github.com/your-org/conductor/issues](https://github.com/your-org/conductor/issues)
-- **Discussions**: [https://github.com/your-org/conductor/discussions](https://github.com/your-org/conductor/discussions)
+- **Documentation**: [https://Mcpylambda-mcp.readthedocs.io](https://Mcpylambda-mcp.readthedocs.io)
+- **Examples**: [https://github.com/your-org/Mcpylambda/tree/main/examples](https://github.com/your-org/Mcpylambda/tree/main/examples)
+- **Issues**: [https://github.com/your-org/Mcpylambda/issues](https://github.com/your-org/Mcpylambda/issues)
+- **Discussions**: [https://github.com/your-org/Mcpylambda/discussions](https://github.com/your-org/Mcpylambda/discussions)
 
 ---
 
 **Made with ❤️ for the AI agent ecosystem**
 
-*Transform your APIs into AI superpowers with Conductor* 🎼
+*Transform your APIs into AI superpowers with Mcpylambda* 🎼
