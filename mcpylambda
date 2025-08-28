@@ -1,0 +1,1097 @@
+"""
+MCP Lambda Framework - Single File Version
+==========================================
+
+A complete Python framework for creating Model Context Protocol (MCP) servers in AWS Lambda.
+This single file contains everything you need - just copy and paste into your Lambda function.
+
+Usage:
+    1. Copy this entire file into your Lambda
+    2. Create your client classes inheriting from MCPClient
+    3. Use @framework.tool(), @framework.resource(), @framework.prompt() decorators
+    4. Set lambda_handler = framework.handle_lambda_event
+
+Example:
+    ```python
+    # Your client
+    class MyAPIClient(MCPClient):
+        def get_data(self, id: int) -> dict:
+            return {"id": id, "data": "example"}
+    
+    # Your tools
+    @framework.tool(description="Get data by ID")
+    def get_data_tool(id: int, client: MyAPIClient) -> dict:
+        return client.get_data(id)
+    
+    # Lambda handler
+    def lambda_handler(event, context):
+        return framework.handle_lambda_event(event, context)
+    ```
+"""
+
+import json
+import inspect
+import logging
+import sys
+from typing import Any, Dict, List, Optional, Union, get_type_hints
+from dataclasses import dataclass
+from enum import Enum
+from abc import ABC, abstractmethod
+import traceback
+
+# Python 3.7 compatibility
+if sys.version_info >= (3, 8):
+    from typing import get_origin, get_args
+else:
+    def get_origin(tp):
+        return getattr(tp, '__origin__', None)
+    
+    def get_args(tp):
+        return getattr(tp, '__args__', ())
+
+# Configure logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# ============================================================================
+# TYPE DEFINITIONS
+# ============================================================================
+
+class MCPContentType(Enum):
+    """MCP content types."""
+    TEXT = "text"
+    IMAGE = "image"
+    RESOURCE = "resource"
+
+
+@dataclass
+class MCPContent:
+    """Base MCP content structure."""
+    type: MCPContentType
+    text: Optional[str] = None
+    data: Optional[bytes] = None
+    mimeType: Optional[str] = None
+
+
+@dataclass
+class MCPToolResult:
+    """Result from an MCP tool execution."""
+    content: List[MCPContent]
+    isError: bool = False
+
+
+@dataclass
+class MCPResourceResult:
+    """Result from an MCP resource request."""
+    uri: str
+    mimeType: Optional[str] = None
+    text: Optional[str] = None
+    blob: Optional[bytes] = None
+
+
+@dataclass
+class MCPPromptResult:
+    """Result from an MCP prompt request."""
+    messages: List[Dict[str, Any]]
+    description: Optional[str] = None
+
+
+@dataclass
+class MCPToolDefinition:
+    """Definition of an MCP tool."""
+    name: str
+    description: str
+    inputSchema: Dict[str, Any]
+    handler: callable
+
+
+@dataclass
+class MCPResourceDefinition:
+    """Definition of an MCP resource."""
+    uri_template: str
+    name: str
+    description: str
+    handler: callable
+    mimeType: Optional[str] = None
+
+
+@dataclass
+class MCPPromptDefinition:
+    """Definition of an MCP prompt."""
+    name: str
+    description: str
+    arguments: List[Dict[str, Any]]
+    handler: callable
+
+
+# Lambda event types
+LambdaEvent = Dict[str, Any]
+LambdaContext = Any
+
+# MCP JSON-RPC types
+MCPRequest = Dict[str, Any]
+MCPResponse = Dict[str, Any]
+
+# ============================================================================
+# BASE CLIENT CLASS
+# ============================================================================
+
+class MCPClient(ABC):
+    """
+    Base class for MCP clients that interact with external APIs.
+    
+    This class provides a foundation for creating API clients that can be
+    automatically injected into MCP tool handlers based on type hints.
+    """
+    
+    def __init__(self):
+        self._cached_auth = False
+        self._client_instance = None
+    
+    @abstractmethod
+    def authenticate(self) -> bool:
+        """
+        Authenticate with the external service.
+        
+        Returns:
+            bool: True if authentication successful, False otherwise
+        """
+        pass
+    
+    def _handle_error(self, error: Exception, context: str = "operation") -> None:
+        """
+        Handle and log errors consistently.
+        
+        Args:
+            error: The exception that occurred
+            context: Context description for the error
+        """
+        logger.error(f"Error during {context}: {str(error)}")
+        logger.debug(f"Full traceback: {traceback.format_exc()}")
+    
+    def _ensure_authenticated(self) -> bool:
+        """
+        Ensure the client is authenticated before making requests.
+        
+        Returns:
+            bool: True if authenticated, False otherwise
+        """
+        if not self._cached_auth:
+            try:
+                self._cached_auth = self.authenticate()
+            except Exception as e:
+                self._handle_error(e, "authentication")
+                return False
+        return self._cached_auth
+
+# ============================================================================
+# SCHEMA GENERATION UTILITIES
+# ============================================================================
+
+def python_type_to_json_schema(python_type: type) -> Dict[str, Any]:
+    """
+    Convert Python type hints to JSON Schema format.
+    
+    Args:
+        python_type: Python type to convert
+        
+    Returns:
+        JSON Schema representation of the type
+    """
+    # Handle Optional types (Union[T, None])
+    origin = get_origin(python_type)
+    if origin is Union:
+        args = get_args(python_type)
+        if len(args) == 2 and type(None) in args:
+            # This is Optional[T]
+            non_none_type = args[0] if args[1] is type(None) else args[1]
+            return python_type_to_json_schema(non_none_type)
+    
+    # Handle List types
+    if origin is list or python_type is list:
+        if origin is list:
+            args = get_args(python_type)
+            if args:
+                return {
+                    "type": "array",
+                    "items": python_type_to_json_schema(args[0])
+                }
+        return {"type": "array"}
+    
+    # Handle Dict types
+    if origin is dict or python_type is dict:
+        return {"type": "object"}
+    
+    # Basic types
+    type_mapping = {
+        str: {"type": "string"},
+        int: {"type": "integer"},
+        float: {"type": "number"},
+        bool: {"type": "boolean"},
+        list: {"type": "array"},
+        dict: {"type": "object"},
+    }
+    
+    return type_mapping.get(python_type, {"type": "string"})
+
+
+def generate_schema_from_function(func: callable) -> Dict[str, Any]:
+    """
+    Generate JSON Schema from function signature.
+    
+    Args:
+        func: Function to analyze
+        
+    Returns:
+        JSON Schema for the function parameters
+    """
+    sig = inspect.signature(func)
+    type_hints = get_type_hints(func)
+    
+    properties = {}
+    required = []
+    
+    for param_name, param in sig.parameters.items():
+        # Skip 'self' and client injection parameters
+        if param_name == 'self':
+            continue
+            
+        # Check if this is a client injection parameter
+        param_type = type_hints.get(param_name)
+        if param_type and issubclass(param_type, MCPClient):
+            continue
+        
+        # Generate schema for this parameter
+        if param_name in type_hints:
+            param_schema = python_type_to_json_schema(type_hints[param_name])
+        else:
+            param_schema = {"type": "string"}  # Default fallback
+        
+        properties[param_name] = param_schema
+        
+        # Check if parameter is required (no default value)
+        if param.default is inspect.Parameter.empty:
+            required.append(param_name)
+    
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required
+    }
+
+# ============================================================================
+# MAIN FRAMEWORK CLASS
+# ============================================================================
+
+class MCPLambdaFramework:
+    """
+    Main framework class for creating MCP servers in AWS Lambda.
+    
+    This class provides decorators for registering tools, resources, and prompts,
+    handles MCP protocol communication, and manages client dependency injection.
+    """
+    
+    def __init__(self, name: str, version: str = "1.0.0"):
+        """
+        Initialize the MCP Lambda Framework.
+        
+        Args:
+            name: Name of the MCP server
+            version: Version of the MCP server
+        """
+        self.name = name
+        self.version = version
+        self.tools: Dict[str, MCPToolDefinition] = {}
+        self.resources: Dict[str, MCPResourceDefinition] = {}
+        self.prompts: Dict[str, MCPPromptDefinition] = {}
+        self._client_instances: Dict[type, MCPClient] = {}
+    
+    def tool(self, name: str = None, description: str = ""):
+        """
+        Decorator to register a function as an MCP tool.
+        
+        Args:
+            name: Name of the tool (defaults to function name)
+            description: Description of what the tool does
+            
+        Returns:
+            Decorator function
+        """
+        def decorator(func: callable) -> callable:
+            tool_name = name or func.__name__
+            
+            # Generate schema from function signature
+            input_schema = generate_schema_from_function(func)
+            
+            # Create tool definition
+            tool_def = MCPToolDefinition(
+                name=tool_name,
+                description=description or func.__doc__ or f"Execute {tool_name}",
+                inputSchema=input_schema,
+                handler=func
+            )
+            
+            self.tools[tool_name] = tool_def
+            return func
+        
+        return decorator
+    
+    def resource(self, uri_template: str, name: str = None, description: str = "", mime_type: str = None):
+        """
+        Decorator to register a function as an MCP resource.
+        
+        Args:
+            uri_template: URI template for the resource (e.g., "myapi://item/{id}")
+            name: Name of the resource (defaults to function name)
+            description: Description of the resource
+            mime_type: MIME type of the resource content
+            
+        Returns:
+            Decorator function
+        """
+        def decorator(func: callable) -> callable:
+            resource_name = name or func.__name__
+            
+            resource_def = MCPResourceDefinition(
+                uri_template=uri_template,
+                name=resource_name,
+                description=description or func.__doc__ or f"Access {resource_name}",
+                handler=func,
+                mimeType=mime_type
+            )
+            
+            self.resources[uri_template] = resource_def
+            return func
+        
+        return decorator
+    
+    def prompt(self, name: str = None, description: str = ""):
+        """
+        Decorator to register a function as an MCP prompt.
+        
+        Args:
+            name: Name of the prompt (defaults to function name)
+            description: Description of the prompt
+            
+        Returns:
+            Decorator function
+        """
+        def decorator(func: callable) -> callable:
+            prompt_name = name or func.__name__
+            
+            # Generate arguments schema from function signature
+            sig = inspect.signature(func)
+            type_hints = get_type_hints(func)
+            
+            arguments = []
+            for param_name, param in sig.parameters.items():
+                if param_name == 'self':
+                    continue
+                
+                arg_def = {
+                    "name": param_name,
+                    "description": f"Parameter {param_name}",
+                    "required": param.default is inspect.Parameter.empty
+                }
+                arguments.append(arg_def)
+            
+            prompt_def = MCPPromptDefinition(
+                name=prompt_name,
+                description=description or func.__doc__ or f"Generate {prompt_name}",
+                arguments=arguments,
+                handler=func
+            )
+            
+            self.prompts[prompt_name] = prompt_def
+            return func
+        
+        return decorator
+    
+    def _get_client_instance(self, client_type: type) -> MCPClient:
+        """
+        Get or create a client instance (singleton pattern for Lambda container reuse).
+        
+        Args:
+            client_type: Type of client to get/create
+            
+        Returns:
+            Client instance
+        """
+        if client_type not in self._client_instances:
+            self._client_instances[client_type] = client_type()
+        return self._client_instances[client_type]
+    
+    def _inject_dependencies(self, func: callable, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Inject client dependencies into function call based on type hints.
+        
+        Args:
+            func: Function to call
+            kwargs: Current keyword arguments
+            
+        Returns:
+            Updated kwargs with injected clients
+        """
+        type_hints = get_type_hints(func)
+        sig = inspect.signature(func)
+        
+        for param_name, param_type in type_hints.items():
+            if param_name in sig.parameters and param_name not in kwargs:
+                # Check if this parameter type is a subclass of MCPClient
+                if (inspect.isclass(param_type) and 
+                    issubclass(param_type, MCPClient)):
+                    
+                    # Inject client instance
+                    client_instance = self._get_client_instance(param_type)
+                    
+                    # Ensure client is authenticated
+                    if not client_instance._ensure_authenticated():
+                        raise Exception(f"Failed to authenticate {param_type.__name__}")
+                    
+                    kwargs[param_name] = client_instance
+        
+        return kwargs
+    
+    def _extract_uri_parameters(self, uri_template: str, actual_uri: str) -> Dict[str, str]:
+        """
+        Extract parameters from URI based on template.
+        
+        Args:
+            uri_template: Template with {param} placeholders
+            actual_uri: Actual URI to extract from
+            
+        Returns:
+            Dictionary of extracted parameters
+        """
+        import re
+        
+        # Convert template to regex pattern
+        pattern = uri_template
+        param_names = []
+        
+        # Find all {param} patterns
+        for match in re.finditer(r'\{([^}]+)\}', uri_template):
+            param_name = match.group(1)
+            param_names.append(param_name)
+            pattern = pattern.replace(f'{{{param_name}}}', r'([^/]+)')
+        
+        # Match against actual URI
+        match = re.match(pattern, actual_uri)
+        if not match:
+            return {}
+        
+        # Extract parameter values
+        params = {}
+        for i, param_name in enumerate(param_names):
+            params[param_name] = match.group(i + 1)
+        
+        return params
+    
+    def _handle_tools_list(self, request: MCPRequest) -> MCPResponse:
+        """Handle tools/list request."""
+        tools = []
+        for tool_def in self.tools.values():
+            tools.append({
+                "name": tool_def.name,
+                "description": tool_def.description,
+                "inputSchema": tool_def.inputSchema
+            })
+        
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "result": {
+                "tools": tools
+            }
+        }
+    
+    def _handle_tools_call(self, request: MCPRequest) -> MCPResponse:
+        """Handle tools/call request."""
+        params = request.get("params", {})
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+        
+        if tool_name not in self.tools:
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {
+                    "code": -32601,
+                    "message": f"Tool '{tool_name}' not found"
+                }
+            }
+        
+        try:
+            tool_def = self.tools[tool_name]
+            
+            # Inject dependencies
+            kwargs = self._inject_dependencies(tool_def.handler, arguments.copy())
+            
+            # Call the tool handler
+            result = tool_def.handler(**kwargs)
+            
+            # Format result
+            if isinstance(result, MCPToolResult):
+                content = []
+                for item in result.content:
+                    content_dict = {"type": item.type.value}
+                    if item.text:
+                        content_dict["text"] = item.text
+                    if item.data:
+                        content_dict["data"] = item.data
+                    if item.mimeType:
+                        content_dict["mimeType"] = item.mimeType
+                    content.append(content_dict)
+                
+                return {
+                    "jsonrpc": "2.0",
+                    "id": request.get("id"),
+                    "result": {
+                        "content": content,
+                        "isError": result.isError
+                    }
+                }
+            else:
+                # Simple result - convert to text content
+                return {
+                    "jsonrpc": "2.0",
+                    "id": request.get("id"),
+                    "result": {
+                        "content": [{
+                            "type": "text",
+                            "text": json.dumps(result) if not isinstance(result, str) else result
+                        }]
+                    }
+                }
+        
+        except Exception as e:
+            logger.error(f"Error calling tool {tool_name}: {str(e)}")
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
+            
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {
+                    "code": -32603,
+                    "message": f"Internal error: {str(e)}"
+                }
+            }
+    
+    def _handle_resources_list(self, request: MCPRequest) -> MCPResponse:
+        """Handle resources/list request."""
+        resources = []
+        for resource_def in self.resources.values():
+            resource_dict = {
+                "uri": resource_def.uri_template,
+                "name": resource_def.name,
+                "description": resource_def.description
+            }
+            if resource_def.mimeType:
+                resource_dict["mimeType"] = resource_def.mimeType
+            resources.append(resource_dict)
+        
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "result": {
+                "resources": resources
+            }
+        }
+    
+    def _handle_resources_read(self, request: MCPRequest) -> MCPResponse:
+        """Handle resources/read request."""
+        params = request.get("params", {})
+        uri = params.get("uri")
+        
+        if not uri:
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {
+                    "code": -32602,
+                    "message": "Missing required parameter: uri"
+                }
+            }
+        
+        # Find matching resource template
+        matching_resource = None
+        uri_params = {}
+        
+        for template, resource_def in self.resources.items():
+            params = self._extract_uri_parameters(template, uri)
+            if params or template == uri:  # Exact match or parameter match
+                matching_resource = resource_def
+                uri_params = params
+                break
+        
+        if not matching_resource:
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {
+                    "code": -32601,
+                    "message": f"Resource not found: {uri}"
+                }
+            }
+        
+        try:
+            # Inject dependencies and URI parameters
+            kwargs = self._inject_dependencies(matching_resource.handler, uri_params.copy())
+            
+            # Call the resource handler
+            result = matching_resource.handler(**kwargs)
+            
+            # Format result
+            if isinstance(result, MCPResourceResult):
+                response_data = {
+                    "contents": [{
+                        "uri": result.uri,
+                        "mimeType": result.mimeType
+                    }]
+                }
+                if result.text:
+                    response_data["contents"][0]["text"] = result.text
+                if result.blob:
+                    response_data["contents"][0]["blob"] = result.blob
+            else:
+                # Simple string result
+                response_data = {
+                    "contents": [{
+                        "uri": uri,
+                        "mimeType": matching_resource.mimeType or "text/plain",
+                        "text": str(result)
+                    }]
+                }
+            
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "result": response_data
+            }
+        
+        except Exception as e:
+            logger.error(f"Error reading resource {uri}: {str(e)}")
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
+            
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {
+                    "code": -32603,
+                    "message": f"Internal error: {str(e)}"
+                }
+            }
+    
+    def _handle_prompts_list(self, request: MCPRequest) -> MCPResponse:
+        """Handle prompts/list request."""
+        prompts = []
+        for prompt_def in self.prompts.values():
+            prompts.append({
+                "name": prompt_def.name,
+                "description": prompt_def.description,
+                "arguments": prompt_def.arguments
+            })
+        
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "result": {
+                "prompts": prompts
+            }
+        }
+    
+    def _handle_prompts_get(self, request: MCPRequest) -> MCPResponse:
+        """Handle prompts/get request."""
+        params = request.get("params", {})
+        prompt_name = params.get("name")
+        arguments = params.get("arguments", {})
+        
+        if prompt_name not in self.prompts:
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {
+                    "code": -32601,
+                    "message": f"Prompt '{prompt_name}' not found"
+                }
+            }
+        
+        try:
+            prompt_def = self.prompts[prompt_name]
+            
+            # Call the prompt handler
+            result = prompt_def.handler(**arguments)
+            
+            # Format result
+            if isinstance(result, MCPPromptResult):
+                response_data = {
+                    "messages": result.messages
+                }
+                if result.description:
+                    response_data["description"] = result.description
+            else:
+                # Simple string result - convert to message format
+                response_data = {
+                    "messages": [{
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": str(result)
+                        }
+                    }]
+                }
+            
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "result": response_data
+            }
+        
+        except Exception as e:
+            logger.error(f"Error getting prompt {prompt_name}: {str(e)}")
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
+            
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {
+                    "code": -32603,
+                    "message": f"Internal error: {str(e)}"
+                }
+            }
+    
+    def _handle_initialize(self, request: MCPRequest) -> MCPResponse:
+        """Handle initialize request."""
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {},
+                    "resources": {},
+                    "prompts": {}
+                },
+                "serverInfo": {
+                    "name": self.name,
+                    "version": self.version
+                }
+            }
+        }
+    
+    def handle_mcp_request(self, request: MCPRequest) -> MCPResponse:
+        """
+        Handle an MCP JSON-RPC request.
+        
+        Args:
+            request: MCP request dictionary
+            
+        Returns:
+            MCP response dictionary
+        """
+        method = request.get("method")
+        
+        # Route to appropriate handler
+        handlers = {
+            "initialize": self._handle_initialize,
+            "tools/list": self._handle_tools_list,
+            "tools/call": self._handle_tools_call,
+            "resources/list": self._handle_resources_list,
+            "resources/read": self._handle_resources_read,
+            "prompts/list": self._handle_prompts_list,
+            "prompts/get": self._handle_prompts_get,
+        }
+        
+        if method in handlers:
+            return handlers[method](request)
+        else:
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {
+                    "code": -32601,
+                    "message": f"Method not found: {method}"
+                }
+            }
+    
+    def handle_lambda_event(self, event: LambdaEvent, context: LambdaContext) -> Dict[str, Any]:
+        """
+        Handle AWS Lambda event and route to appropriate MCP handler.
+        
+        Args:
+            event: Lambda event dictionary
+            context: Lambda context object
+            
+        Returns:
+            Lambda response dictionary
+        """
+        try:
+            # Handle API Gateway events
+            if "httpMethod" in event or "requestContext" in event:
+                # Extract body from API Gateway event
+                body = event.get("body", "{}")
+                if isinstance(body, str):
+                    try:
+                        mcp_request = json.loads(body)
+                    except json.JSONDecodeError:
+                        return {
+                            "statusCode": 400,
+                            "headers": {"Content-Type": "application/json"},
+                            "body": json.dumps({
+                                "jsonrpc": "2.0",
+                                "error": {
+                                    "code": -32700,
+                                    "message": "Parse error"
+                                }
+                            })
+                        }
+                else:
+                    mcp_request = body
+                
+                # Handle MCP request
+                mcp_response = self.handle_mcp_request(mcp_request)
+                
+                # Return API Gateway response
+                return {
+                    "statusCode": 200,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Methods": "POST, OPTIONS",
+                        "Access-Control-Allow-Headers": "Content-Type"
+                    },
+                    "body": json.dumps(mcp_response)
+                }
+            
+            # Handle direct Lambda invocation (MCP request as event)
+            else:
+                mcp_response = self.handle_mcp_request(event)
+                return mcp_response
+        
+        except Exception as e:
+            logger.error(f"Error handling Lambda event: {str(e)}")
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
+            
+            error_response = {
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32603,
+                    "message": f"Internal error: {str(e)}"
+                }
+            }
+            
+            # Return appropriate format based on event type
+            if "httpMethod" in event or "requestContext" in event:
+                return {
+                    "statusCode": 500,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps(error_response)
+                }
+            else:
+                return error_response
+
+
+# ============================================================================
+# FRAMEWORK INSTANCE
+# ============================================================================
+
+# Create a default framework instance that can be used directly
+framework = MCPLambdaFramework("MCP Lambda Server", "1.0.0")
+
+# ============================================================================
+# EXAMPLE USAGE - Calculator MCP Server
+# ============================================================================
+
+# Example Client - Simple Calculator
+class CalculatorClient(MCPClient):
+    """Simple calculator client that performs basic math operations."""
+    
+    def authenticate(self) -> bool:
+        """No authentication needed for calculator."""
+        return True
+    
+    def add(self, a: float, b: float) -> float:
+        """Add two numbers."""
+        return a + b
+    
+    def subtract(self, a: float, b: float) -> float:
+        """Subtract b from a."""
+        return a - b
+    
+    def multiply(self, a: float, b: float) -> float:
+        """Multiply two numbers."""
+        return a * b
+    
+    def divide(self, a: float, b: float) -> float:
+        """Divide a by b."""
+        if b == 0:
+            raise ValueError("Cannot divide by zero")
+        return a / b
+    
+    def get_history(self) -> list:
+        """Get calculation history (mock data)."""
+        return [
+            {"operation": "add", "a": 5, "b": 3, "result": 8},
+            {"operation": "multiply", "a": 4, "b": 7, "result": 28},
+            {"operation": "divide", "a": 10, "b": 2, "result": 5.0}
+        ]
+
+
+# Example Tools
+@framework.tool(description="Say hello")
+def hello_world(name: str = "World") -> str:
+    """Simple hello world function."""
+    return f"Hello, {name}!"
+
+
+@framework.tool(description="Add two numbers")
+def add(a: float, b: float, client: CalculatorClient) -> dict:
+    """Add two numbers using the calculator client."""
+    result = client.add(a, b)
+    return {
+        "operation": "addition",
+        "a": a,
+        "b": b,
+        "result": result,
+        "expression": f"{a} + {b} = {result}"
+    }
+
+
+@framework.tool(description="Subtract two numbers")
+def subtract(a: float, b: float, client: CalculatorClient) -> dict:
+    """Subtract b from a using the calculator client."""
+    result = client.subtract(a, b)
+    return {
+        "operation": "subtraction",
+        "a": a,
+        "b": b,
+        "result": result,
+        "expression": f"{a} - {b} = {result}"
+    }
+
+
+@framework.tool(description="Multiply two numbers")
+def multiply(a: float, b: float, client: CalculatorClient) -> dict:
+    """Multiply two numbers using the calculator client."""
+    result = client.multiply(a, b)
+    return {
+        "operation": "multiplication",
+        "a": a,
+        "b": b,
+        "result": result,
+        "expression": f"{a} × {b} = {result}"
+    }
+
+
+@framework.tool(description="Divide two numbers")
+def divide(a: float, b: float, client: CalculatorClient) -> dict:
+    """Divide a by b using the calculator client."""
+    try:
+        result = client.divide(a, b)
+        return {
+            "operation": "division",
+            "a": a,
+            "b": b,
+            "result": result,
+            "expression": f"{a} ÷ {b} = {result}"
+        }
+    except ValueError as e:
+        return {
+            "operation": "division",
+            "a": a,
+            "b": b,
+            "error": str(e),
+            "expression": f"{a} ÷ {b} = ERROR"
+        }
+
+
+# Example Resource
+@framework.resource("calculator://history", description="Calculator operation history")
+def get_calculator_history(client: CalculatorClient) -> str:
+    """Get calculator history as a formatted resource."""
+    history = client.get_history()
+    
+    result = "Calculator History:\n\n"
+    for i, calc in enumerate(history, 1):
+        result += f"{i}. {calc['operation']}: {calc['a']} and {calc['b']} = {calc['result']}\n"
+    
+    return result
+
+
+@framework.resource("calculator://operation/{operation_id}", description="Specific calculator operation")
+def get_operation_details(operation_id: str, client: CalculatorClient) -> str:
+    """Get details of a specific operation."""
+    history = client.get_history()
+    
+    try:
+        op_index = int(operation_id) - 1
+        if 0 <= op_index < len(history):
+            calc = history[op_index]
+            return f"""
+Operation #{operation_id}
+Type: {calc['operation']}
+Input A: {calc['a']}
+Input B: {calc['b']}
+Result: {calc['result']}
+Expression: {calc['a']} {calc['operation']} {calc['b']} = {calc['result']}
+"""
+        else:
+            return f"Operation #{operation_id} not found"
+    except ValueError:
+        return f"Invalid operation ID: {operation_id}"
+
+
+# Example Prompt
+@framework.prompt(description="Generate a math problem prompt")
+def create_math_problem(difficulty: str = "easy", operation: str = "any") -> str:
+    """Generate a prompt for creating math problems."""
+    return f"""
+Please create a {difficulty} math problem using {operation} operations.
+
+Requirements:
+- Difficulty level: {difficulty}
+- Operation type: {operation}
+- Provide the problem and solution
+- Explain the steps if it's a complex problem
+
+Use the calculator tools (add, subtract, multiply, divide) to verify your answer.
+"""
+
+
+# Lambda Handler
+def lambda_handler(event, context):
+    """AWS Lambda handler for the Calculator MCP server."""
+    return framework.handle_lambda_event(event, context)
+
+
+# For local testing
+if __name__ == "__main__":
+    # Test the framework locally
+    print("Testing Calculator MCP Server...")
+    
+    # Test tools list
+    test_event = {
+        "jsonrpc": "2.0",
+        "method": "tools/list",
+        "id": 1
+    }
+    
+    result = framework.handle_lambda_event(test_event, None)
+    print("\nAvailable tools:")
+    for tool in result.get("result", {}).get("tools", []):
+        print(f"- {tool['name']}: {tool['description']}")
+    
+    # Test a calculation
+    calc_event = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "add",
+            "arguments": {"a": 5, "b": 3}
+        },
+        "id": 2
+    }
+    
+    calc_result = framework.handle_lambda_event(calc_event, None)
+    print(f"\nTest calculation (5 + 3):")
+    print(calc_result.get("result", {}).get("content", [{}])[0].get("text", "No result"))
